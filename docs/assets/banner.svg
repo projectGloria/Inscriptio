@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-label="Inscriptio: copy a link, paste a clean one">
+  <rect width="1280" height="320" rx="16" fill="#111111"/>
+  <rect x="0.5" y="0.5" width="1279" height="319" rx="16" fill="none" stroke="#2C2C2C"/>
+  <text x="80" y="92" font-family="Segoe UI, -apple-system, Helvetica, Arial, sans-serif" font-size="44" font-weight="600" fill="#EDEDED">Inscriptio</text>
+  <text x="80" y="130" font-family="Segoe UI, -apple-system, Helvetica, Arial, sans-serif" font-size="22" fill="#8B8B8B">Copy a link. Paste a clean one.</text>
+
+  <rect x="80" y="166" width="1120" height="52" rx="10" fill="#1C1C1C" stroke="#2C2C2C"/>
+  <text x="104" y="199" font-family="Cascadia Mono, Consolas, Menlo, monospace" font-size="20" fill="#8B8B8B">https://www.youtube.com/watch?v=jdkJ3kjp6Ig<tspan fill="#E5484D">&amp;pp=ygUEcnVzdA%3D%3D&amp;si=uzzTs2I6NxtdTDtK</tspan>&amp;t=42s</text>
+
+  <rect x="80" y="234" width="1120" height="52" rx="10" fill="#1C1C1C" stroke="#3ECF8E"/>
+  <circle cx="108" cy="260" r="6" fill="#3ECF8E"/>
+  <text x="128" y="267" font-family="Cascadia Mono, Consolas, Menlo, monospace" font-size="20" fill="#EDEDED">https://youtu.be/jdkJ3kjp6Ig?t=42s</text>
+</svg>
