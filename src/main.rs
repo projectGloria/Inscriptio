@@ -24,6 +24,9 @@ use clipboard::trace;
 
 /// Explorer broadcasts this after it restarts. Re-adding the icon on it keeps
 /// the tray entry from silently vanishing after an explorer.exe crash.
+/// Posted by a second `--settings` launch (see main) to the running instance.
+const WM_SHOW_SETTINGS: u32 = WM_APP + 3;
+
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 fn main() {
@@ -35,10 +38,24 @@ fn main() {
         if std::env::args().any(|a| a == "--trace") {
             clipboard::TRACE.store(true, Relaxed);
         }
+        let open_settings = std::env::args().any(|a| a == "--settings");
         if already_running {
             // Easy to trip over: `--trace` while the tray copy runs does nothing,
             // because the first instance owns the listener.
             trace!("another instance is already running, exiting (quit the tray one first)");
+            if open_settings {
+                // The Start-menu shortcut runs `--settings`: hand the request to
+                // the running copy instead of silently exiting.
+                let main = FindWindowW(w!("InscriptioWnd"), null());
+                if !main.is_null() {
+                    // We were just launched by the user, so *we* hold the foreground
+                    // right. Pass it on, or Windows would only flash the taskbar.
+                    let mut pid = 0;
+                    GetWindowThreadProcessId(main, &mut pid);
+                    AllowSetForegroundWindow(pid);
+                    PostMessageW(main, WM_SHOW_SETTINGS, 0, 0);
+                }
+            }
             return;
         }
         trace!("--- started (log: {})", std::env::temp_dir().join("inscriptio.log").display());
@@ -70,7 +87,7 @@ fn main() {
             trace!("listening for clipboard changes");
         }
         tray::add(hwnd);
-        if std::env::args().any(|a| a == "--settings") {
+        if open_settings {
             ui::show(); // open the window straight away (handy for a Start-menu shortcut)
         }
 
@@ -98,6 +115,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 } else {
                     clipboard::on_update(hwnd);
                 }
+                0
+            }
+            WM_SHOW_SETTINGS => {
+                ui::show();
                 0
             }
             tray::WM_TRAY => {
