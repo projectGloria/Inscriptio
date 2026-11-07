@@ -1,0 +1,5 @@
+// ID 1: Explorer uses the lowest-numbered icon group as the exe icon, and
+// tray.rs loads the same ID for the notification area.
+1 ICON "Inscriptio.ico"
+// 24 = RT_MANIFEST, ID 1 = the process manifest (visual styles + DPI awareness).
+1 24 "app.manifest"
