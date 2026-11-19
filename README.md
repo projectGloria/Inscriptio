@@ -156,6 +156,16 @@ Uninstalling removes the program, its settings, its history and the autostart en
    & .\installer\build.ps1
    ```
 
+## How to release
+
+1. Update the version in `Cargo.toml` (and `app.rc`) and commit the change.
+2. Create and push a version tag:
+   ```bash
+   git tag v1.0.0 && git push --tags
+   ```
+3. GitHub Actions (`.github/workflows/build-installers.yml`) builds the Windows x64 installer (`Inscriptio-<version>-windows-x64.exe`), uploads it as the **`installers`** workflow artifact on the **Actions** tab, and automatically publishes a GitHub Release with the installer attached.
+4. Download published installers from the [Releases](https://github.com/projectGloria/Inscriptio/releases) page (or from the **`installers`** artifact on any manual run triggered via **Actions → Build Installers → Run workflow**).
+
 ## Contributing
 
 Issues and pull requests are welcome. New site rules belong in [`src/rules.rs`](src/rules.rs) together with a test case showing the input and the expected output. Please run `cargo test` before opening a pull request.

@@ -1,0 +1,128 @@
+name: Build Installers
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Build Windows Installer (x64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Update Rust toolchain (stable)
+        shell: pwsh
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Resolve version
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $version = "${{ github.ref_name }}" -replace '^v', ''
+          } else {
+            $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          }
+          if (-not $version) { throw "Could not determine application version." }
+          Write-Host "Building Inscriptio version: $version"
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Run tests
+        shell: pwsh
+        run: cargo test --locked
+
+      - name: Build release binary
+        shell: pwsh
+        run: cargo build --release --locked
+
+      - name: Ensure Inno Setup 6.7+ is installed
+        shell: pwsh
+        run: |
+          $iscc = @(
+            (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source,
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+
+          $needInstall = $true
+          if ($iscc) {
+            $ver = (Get-Item $iscc).VersionInfo.FileVersionRaw
+            Write-Host "Found ISCC.exe at $iscc (version $ver)"
+            if ($ver -ge [version]"6.7.0.0") {
+              $needInstall = $false
+            }
+          }
+
+          if ($needInstall) {
+            Write-Host "Installing Inno Setup 6.7+..."
+            choco install innosetup --yes --no-progress --force
+            if ($LASTEXITCODE -ne 0) { throw "Failed to install Inno Setup." }
+          }
+
+      - name: Build installer and collect into installers/
+        shell: pwsh
+        run: |
+          $iscc = @(
+            (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source,
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $iscc) { throw "ISCC.exe not found after installation." }
+
+          & $iscc /Qp "/DAppVersion=$env:VERSION" installer\Inscriptio.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE." }
+
+          New-Item -ItemType Directory -Path installers -Force | Out-Null
+          $built = "dist\Inscriptio-$env:VERSION-setup.exe"
+          $target = "installers\Inscriptio-$env:VERSION-windows-x64.exe"
+          Copy-Item -Path $built -Destination $target -Force
+          Get-Item $target | Select-Object Name, Length
+
+      - name: Upload installers artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: installers
+          path: installers/
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: [build-windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download installers artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: installers
+          path: installers
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installers/*
+          generate_release_notes: true
