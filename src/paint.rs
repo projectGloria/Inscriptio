@@ -8,6 +8,7 @@
 //! with signed-distance-field coverage (same trick as the tray badge), then
 //! does one BitBlt. Double-buffered for free, with no GDI+ or Direct2D load.
 
+use std::cell::RefCell;
 use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::{COLORREF, RECT};
 use windows_sys::Win32::Graphics::Gdi::*;
@@ -35,36 +36,96 @@ pub struct Canvas {
     bmp: HBITMAP,
     old: HGDIOBJ,
     px: *mut u32,
+    buf_w: i32,
+    buf_h: i32,
     pub w: i32,
     pub h: i32,
+}
+
+thread_local! {
+    /// Reusable off-screen DIB for the UI thread so paints and slider drags
+    /// don't allocate/destroy GDI objects on every message.
+    static SCRATCH: RefCell<Option<Canvas>> = const { RefCell::new(None) };
+}
+
+/// Free the cached scratch DIB (called when the settings window closes).
+pub fn release_scratch() {
+    SCRATCH.with_borrow_mut(|slot| *slot = None);
 }
 
 impl Canvas {
     pub fn new(like: HDC, w: i32, h: i32, bg: u32) -> Option<Canvas> {
         let (w, h) = (w.max(1), h.max(1));
+        (w as usize).checked_mul(h as usize)?;
         unsafe {
             let mut bi: BITMAPINFO = std::mem::zeroed();
             bi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
             bi.bmiHeader.biWidth = w;
-            bi.bmiHeader.biHeight = -h; // negative = top-down rows, so index = y*w + x
+            bi.bmiHeader.biHeight = -h; // negative = top-down rows, so index = y*buf_w + x
             bi.bmiHeader.biPlanes = 1;
             bi.bmiHeader.biBitCount = 32;
             let mut bits = null_mut();
             let bmp = CreateDIBSection(like, &bi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
-            if bmp.is_null() {
+            if bmp.is_null() || bits.is_null() {
+                if !bmp.is_null() {
+                    DeleteObject(bmp);
+                }
                 return None;
             }
             let dc = CreateCompatibleDC(like);
+            if dc.is_null() {
+                DeleteObject(bmp);
+                return None;
+            }
             let old = SelectObject(dc, bmp);
-            let mut c = Canvas { dc, bmp, old, px: bits.cast(), w, h };
-            c.pixels().fill(bg);
+            let mut c = Canvas { dc, bmp, old, px: bits.cast(), buf_w: w, buf_h: h, w, h };
+            c.clear(bg);
             Some(c)
         }
     }
 
+    /// Borrow the reusable scratch canvas, growing it only when needed.
+    pub fn with_scratch(like: HDC, w: i32, h: i32, bg: u32, f: impl FnOnce(&mut Canvas)) {
+        let (w, h) = (w.max(1), h.max(1));
+        SCRATCH.with_borrow_mut(|slot| {
+            let needs_new = slot.as_ref().is_none_or(|c| c.buf_w < w || c.buf_h < h);
+            if needs_new {
+                let (nw, nh) = match slot.as_ref() {
+                    Some(c) => (c.buf_w.max(w), c.buf_h.max(h)),
+                    None => (w, h),
+                };
+                *slot = Canvas::new(like, nw, nh, bg);
+            }
+            if let Some(c) = slot.as_mut() {
+                c.w = w;
+                c.h = h;
+                if !needs_new {
+                    unsafe { GdiFlush() };
+                    c.clear(bg);
+                }
+                f(c);
+            }
+        });
+    }
+
+    fn clear(&mut self, bg: u32) {
+        let stride = self.buf_w as usize;
+        let w = self.w as usize;
+        let h = self.h as usize;
+        let px = self.pixels();
+        if w == stride {
+            px[..w * h].fill(bg);
+        } else {
+            for y in 0..h {
+                let row = y * stride;
+                px[row..row + w].fill(bg);
+            }
+        }
+    }
+
     fn pixels(&mut self) -> &mut [u32] {
-        // The DIB section owns w*h u32s for as long as `bmp` lives (until Drop).
-        unsafe { std::slice::from_raw_parts_mut(self.px, (self.w * self.h) as usize) }
+        // The DIB section owns buf_w*buf_h u32s for as long as `bmp` lives (until Drop).
+        unsafe { std::slice::from_raw_parts_mut(self.px, (self.buf_w as usize) * (self.buf_h as usize)) }
     }
 
     /// Filled rounded rectangle. r = h/2 gives a pill, and w = h = 2r a circle.
@@ -80,16 +141,39 @@ impl Canvas {
 
     #[allow(clippy::too_many_arguments)]
     fn shape(&mut self, x: f32, y: f32, w: f32, h: f32, r: f32, stroke: Option<f32>, color: u32) {
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
         // GDI batches calls: flush pending text so our writes don't race it.
         unsafe { GdiFlush() };
-        let (cw, ch) = (self.w, self.h);
+        let (cw, ch, stride) = (self.w, self.h, self.buf_w);
+        let r = r.clamp(0.0, (w.min(h)) / 2.0);
         let (x0, y0) = ((x.floor() as i32).max(0), (y.floor() as i32).max(0));
         let (x1, y1) = (((x + w).ceil() as i32).min(cw), ((y + h).ceil() as i32).min(ch));
         let (cx, cy) = (x + w / 2.0, y + h / 2.0);
         let (hx, hy) = (w / 2.0 - r, h / 2.0 - r);
+
+        // Interior skip / fast-fill bounds: pixels strictly inside this box have
+        // d <= -1 (for fill: cov == 1.0; for stroke: cov == 0.0).
+        let pad = stroke.unwrap_or(0.0) + 1.5;
+        let ix0 = ((x + r.max(pad)).ceil() as i32).clamp(x0, x1);
+        let ix1 = ((x + w - r.max(pad)).floor() as i32).clamp(ix0, x1);
+        let iy0 = ((y + r.max(pad)).ceil() as i32).clamp(y0, y1);
+        let iy1 = ((y + h - r.max(pad)).floor() as i32).clamp(iy0, y1);
+
         let px = self.pixels();
         for py in y0..y1 {
-            for pxi in x0..x1 {
+            let row = (py * stride) as usize;
+            let in_mid_y = py >= iy0 && py < iy1 && ix0 < ix1;
+            let mut pxi = x0;
+            while pxi < x1 {
+                if in_mid_y && pxi == ix0 {
+                    if stroke.is_none() {
+                        px[row + ix0 as usize..row + ix1 as usize].fill(color);
+                    }
+                    pxi = ix1;
+                    continue;
+                }
                 // Rounded-box SDF (Inigo Quilez), sampled at the pixel centre.
                 let qx = (pxi as f32 + 0.5 - cx).abs() - hx;
                 let qy = (py as f32 + 0.5 - cy).abs() - hy;
@@ -101,22 +185,27 @@ impl Canvas {
                 }
                 .clamp(0.0, 1.0);
                 if cov > 0.0 {
-                    let p = &mut px[(py * cw + pxi) as usize];
-                    *p = mix(*p, color, cov);
+                    let p = &mut px[row + pxi as usize];
+                    *p = if cov >= 1.0 { color } else { mix(*p, color, cov) };
                 }
+                pxi += 1;
             }
         }
     }
 
     /// GDI text (keeps ClearType and the user's UI font) on top of the shapes.
     pub fn text(&mut self, s: &str, r: RECT, color: u32, font: HFONT, flags: u32) -> RECT {
+        if font.is_null() {
+            return r;
+        }
         let wide: Vec<u16> = s.encode_utf16().collect();
         let mut r = r;
         unsafe {
-            SelectObject(self.dc, font);
+            let prev = SelectObject(self.dc, font);
             SetBkMode(self.dc, TRANSPARENT as i32);
             SetTextColor(self.dc, cref(color));
             DrawTextW(self.dc, wide.as_ptr(), wide.len() as i32, &mut r, flags | DT_NOPREFIX);
+            SelectObject(self.dc, prev);
         }
         r
     }

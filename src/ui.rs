@@ -28,7 +28,7 @@
 
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering::Relaxed};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::{DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows_sys::Win32::Graphics::Gdi::*;
@@ -40,7 +40,7 @@ use windows_sys::Win32::UI::Controls::{
     TBM_SETPAGESIZE, TBM_SETPOS, TBM_SETRANGE, TBS_BOTH, TBS_NOTICKS, TRACKBAR_CLASSW,
 };
 use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow, SystemParametersInfoForDpi};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, IsWindowEnabled};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, GetKeyState, IsWindowEnabled, VK_C, VK_CONTROL};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::core::w;
 
@@ -54,6 +54,10 @@ pub const WM_REFRESH: u32 = WM_APP + 2;
 static WND: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 static FONT: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 static FONT_BOLD: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+/// History generation last loaded into ID_LIST (0 = not yet populated).
+static LAST_HIST_GEN: AtomicU32 = AtomicU32::new(0);
+
+const ACCENT_PRESSED: u32 = 0x2FA872;
 
 pub fn hwnd() -> HWND {
     WND.load(Relaxed)
@@ -67,7 +71,9 @@ const BN_DOUBLECLICKED: u32 = 5; // owner-draw buttons send this for a fast 2nd 
 const SS_OWNERDRAW: u32 = 0xD;
 const LBS_NOTIFY: u32 = 0x1;
 const LBS_OWNERDRAWFIXED: u32 = 0x10;
+const LBS_HASSTRINGS: u32 = 0x40; // exposes row text to screen readers & type-ahead
 const LBS_NOINTEGRALHEIGHT: u32 = 0x100;
+const LBS_WANTKEYBOARDINPUT: u32 = 0x400; // enables WM_VKEYTOITEM for Ctrl+C in the list
 const LB_ADDSTRING: u32 = 0x180;
 const LB_RESETCONTENT: u32 = 0x184;
 const LB_GETCURSEL: u32 = 0x188;
@@ -95,6 +101,7 @@ const ID_HINT: i32 = 302;
 const ID_CLEAR: i32 = 303;
 const ID_LIST: i32 = 304;
 const ID_STATS: i32 = 401;
+const IDOK_: i32 = 1; // what IsDialogMessage sends for Enter
 const IDCANCEL_: i32 = 2; // what IsDialogMessage sends for Esc
 
 /// Grey "secondary" text.
@@ -103,17 +110,18 @@ const MUTED_IDS: &[i32] = &[ID_ORIG, ID_HINT, ID_STATS, ID_VOL_LBL];
 /// Layout in 96-DPI units ("DIPs"), scaled at runtime. A data table instead of
 /// a sizer framework: the window is fixed-size, so absolute layout is honest.
 const W: i32 = 340;
-const H: i32 = 552;
+const H: i32 = 540;
 const M: i32 = 16;
 const SEPARATORS: [i32; 3] = [56, 224, 316];
 /// Rounded frame drawn by the parent; the (borderless) listbox sits inset inside it.
-const FRAME: (i32, i32, i32, i32) = (M, 362, W - 2 * M, 150);
+/// Inner height = 138 - 8 = 130 = 5 * ROW_H, so no row is clipped in half.
+const FRAME: (i32, i32, i32, i32) = (M, 362, W - 2 * M, 138);
 const ROW_H: i32 = 26;
 
 struct Ctl {
     id: i32,
     class: *const u16,
-    text: *const u16,
+    text: &'static str,
     style: u32,
     r: (i32, i32, i32, i32),
     bold: bool,
@@ -127,30 +135,30 @@ fn controls() -> [Ctl; 17] {
     let (fx, fy, fw, fh) = FRAME;
     // Creation order = Tab order.
     [
-        c(ID_STATUS, w!("STATIC"), w!(""), SS_OWNERDRAW, (M, 14, W - 2 * M - 96, 28), true),
-        c(ID_PAUSE, w!("BUTTON"), w!("Pause"), OWNER_BTN, (W - M - 88, 14, 88, 28), false),
-        c(ID_TIME, w!("BUTTON"), w!("Keep YouTube timestamps"), OWNER_BTN, (M, 64, W - 2 * M, 30), false),
-        c(ID_SOUND, w!("BUTTON"), w!("Play a sound on trim"), OWNER_BTN, (M, 94, W - 2 * M, 30), false),
-        c(ID_VOL_LBL, w!("STATIC"), w!("Volume"), LABEL, (M, 130, 60, 20), false),
-        c(ID_VOLUME, TRACKBAR_CLASSW, w!(""), TBS_BOTH | TBS_NOTICKS | WS_TABSTOP, (M + 56, 124, W - 2 * M - 56, 30), false),
-        c(ID_HISTORY, w!("BUTTON"), w!("Keep history"), OWNER_BTN, (M, 154, W - 2 * M, 30), false),
-        c(ID_AUTOSTART, w!("BUTTON"), w!("Start with Windows"), OWNER_BTN, (M, 184, W - 2 * M, 30), false),
-        c(ID_LAST_HDR, w!("STATIC"), w!("Last trim"), LABEL, (M, 238, 150, 20), true),
-        c(ID_UNDO, w!("BUTTON"), w!("Undo"), OWNER_BTN, (W - M - 72, 234, 72, 28), false),
-        c(ID_ORIG, w!("STATIC"), w!(""), LABEL, (M, 268, W - 2 * M, 18), false),
-        c(ID_SHORT, w!("STATIC"), w!(""), LABEL, (M, 288, W - 2 * M, 18), false),
-        c(ID_HIST_HDR, w!("STATIC"), w!("History"), LABEL, (M, 330, 60, 20), true),
-        c(ID_HINT, w!("STATIC"), w!("double-click to copy"), LABEL, (M + 62, 331, 160, 18), false),
-        c(ID_CLEAR, w!("BUTTON"), w!("Clear"), OWNER_BTN, (W - M - 72, 326, 72, 28), false),
+        c(ID_STATUS, w!("STATIC"), "", SS_OWNERDRAW, (M, 14, W - 2 * M - 96, 28), true),
+        c(ID_PAUSE, w!("BUTTON"), label(ID_PAUSE), OWNER_BTN, (W - M - 88, 14, 88, 28), false),
+        c(ID_TIME, w!("BUTTON"), label(ID_TIME), OWNER_BTN, (M, 64, W - 2 * M, 30), false),
+        c(ID_SOUND, w!("BUTTON"), label(ID_SOUND), OWNER_BTN, (M, 94, W - 2 * M, 30), false),
+        c(ID_VOL_LBL, w!("STATIC"), "Volume", LABEL, (M, 130, 60, 20), false),
+        c(ID_VOLUME, TRACKBAR_CLASSW, "", TBS_BOTH | TBS_NOTICKS | WS_TABSTOP, (M + 56, 124, W - 2 * M - 56, 30), false),
+        c(ID_HISTORY, w!("BUTTON"), label(ID_HISTORY), OWNER_BTN, (M, 154, W - 2 * M, 30), false),
+        c(ID_AUTOSTART, w!("BUTTON"), label(ID_AUTOSTART), OWNER_BTN, (M, 184, W - 2 * M, 30), false),
+        c(ID_LAST_HDR, w!("STATIC"), "Last trim", LABEL, (M, 238, 150, 20), true),
+        c(ID_UNDO, w!("BUTTON"), label(ID_UNDO), OWNER_BTN, (W - M - 72, 234, 72, 28), false),
+        c(ID_ORIG, w!("STATIC"), "", LABEL, (M, 268, W - 2 * M, 18), false),
+        c(ID_SHORT, w!("STATIC"), "", LABEL, (M, 288, W - 2 * M, 18), false),
+        c(ID_HIST_HDR, w!("STATIC"), "History", LABEL, (M, 330, 60, 20), true),
+        c(ID_HINT, w!("STATIC"), "double-click to copy", LABEL, (M + 62, 331, 160, 18), false),
+        c(ID_CLEAR, w!("BUTTON"), label(ID_CLEAR), OWNER_BTN, (W - M - 72, 326, 72, 28), false),
         c(
             ID_LIST,
             w!("LISTBOX"),
-            w!(""),
-            LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP,
+            "",
+            LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT | LBS_WANTKEYBOARDINPUT | WS_VSCROLL | WS_TABSTOP,
             (fx + 4, fy + 4, fw - 8, fh - 8),
             false,
         ),
-        c(ID_STATS, w!("STATIC"), w!(""), LABEL, (M, fy + fh + 10, W - 2 * M, 18), false),
+        c(ID_STATS, w!("STATIC"), "", LABEL, (M, fy + fh + 10, W - 2 * M, 18), false),
     ]
 }
 
@@ -200,6 +208,7 @@ pub fn show() {
         return;
     }
     unsafe {
+        settings::refresh_autostart();
         let hinst = GetModuleHandleW(null());
         static REGISTERED: AtomicBool = AtomicBool::new(false);
         if !REGISTERED.swap(true, Relaxed) {
@@ -211,7 +220,7 @@ pub fn show() {
                 cbSize: size_of::<WNDCLASSEXW>() as u32,
                 lpfnWndProc: Some(proc),
                 hInstance: hinst,
-                hIcon: tray::icon(false),
+                hIcon: tray::large_icon(),
                 hIconSm: tray::icon(false),
                 hCursor: LoadCursorW(null_mut(), IDC_ARROW),
                 hbrBackground: brush(&BRUSH_BG, BG),
@@ -236,6 +245,7 @@ pub fn show() {
             return;
         }
         WND.store(h, Relaxed);
+        LAST_HIST_GEN.store(0, Relaxed);
 
         // Dark title bar (documented since Win11 / Win10 20H1), then paint the
         // caption the same black as the client area (Win11 22000+; ignored before).
@@ -245,7 +255,8 @@ pub fn show() {
         DwmSetWindowAttribute(h, DWMWA_CAPTION_COLOR as u32, (&caption as *const u32).cast(), 4);
 
         for c in controls() {
-            CreateWindowExW(0, c.class, c.text, WS_CHILD | WS_VISIBLE | c.style, 0, 0, 0, 0, h, c.id as isize as _, hinst, null());
+            let text_w = wide(c.text);
+            CreateWindowExW(0, c.class, text_w.as_ptr(), WS_CHILD | WS_VISIBLE | c.style, 0, 0, 0, 0, h, c.id as isize as _, hinst, null());
         }
         let vol = GetDlgItem(h, ID_VOLUME);
         SendMessageW(vol, TBM_SETRANGE, 0, 100 << 16); // MAKELONG(min 0, max 100)
@@ -255,9 +266,13 @@ pub fn show() {
         // class gives a dark one (honoured once dark_menus() opted the app in).
         SetWindowTheme(GetDlgItem(h, ID_LIST), w!("DarkMode_Explorer"), null());
 
-        let (ww, wh) = apply_dpi(h, GetDpiForWindow(h));
-        let gap = scale(12, GetDpiForWindow(h));
-        SetWindowPos(h, null_mut(), work.right - ww - gap, work.bottom - wh - gap, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
+        let dpi = GetDpiForWindow(h);
+        let (ww, wh) = apply_dpi(h, dpi);
+        let gap = scale(12, dpi);
+        // Clamp to work.left/top so short high-DPI displays never push the titlebar off-screen.
+        let x = (work.right - ww - gap).max(work.left);
+        let y = (work.bottom - wh - gap).max(work.top);
+        SetWindowPos(h, null_mut(), x, y, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
         refresh_now(h);
         ShowWindow(h, SW_SHOW);
         SetForegroundWindow(h);
@@ -335,38 +350,67 @@ fn human_bytes(b: u64) -> String {
     }
 }
 
+fn sync_toggle_text(h: HWND, id: i32) {
+    let state = if is_on(id) { "on" } else { "off" };
+    set_text(h, id, &format!("{}, {state}", label(id)));
+}
+
+fn status_text() -> &'static str {
+    if !tray::LISTENER_OK.load(Relaxed) {
+        "Clipboard listener failed"
+    } else if F_ENABLED.get() {
+        "Trimming links"
+    } else {
+        "Paused"
+    }
+}
+
 fn refresh_now(h: HWND) {
     unsafe {
+        // Keep Win32 control text in sync for screen readers (Narrator/NVDA).
+        set_text(h, ID_STATUS, status_text());
+        set_text(h, ID_PAUSE, label(ID_PAUSE));
+        for id in [ID_TIME, ID_SOUND, ID_HISTORY, ID_AUTOSTART] {
+            sync_toggle_text(h, id);
+        }
+
         let vol = GetDlgItem(h, ID_VOLUME);
         EnableWindow(vol, F_SOUND.get() as i32);
         SendMessageW(vol, TBM_SETPOS, 1, settings::VOLUME.load(Relaxed) as LPARAM);
 
-        clipboard::with_last(|l| match l {
-            Some(l) => {
-                set_text(h, ID_ORIG, bare(&l.original));
+        // Clone strings before calling SetDlgItemTextW so no RefCell borrow is
+        // held across synchronous Win32 messages.
+        let (orig_txt, short_txt) = clipboard::with_last(|l| match l {
+            Some(l) if l.private => {
                 let suffix = if l.undone { "   (undone)" } else { "" };
-                set_text(h, ID_SHORT, &format!("→ {}{suffix}", bare(&l.short)));
+                ("Private link (hidden)".to_owned(), format!("→ (hidden){suffix}"))
             }
-            None => {
-                set_text(h, ID_ORIG, "Nothing trimmed yet. Copy a link.");
-                set_text(h, ID_SHORT, "");
+            Some(l) => {
+                let suffix = if l.undone { "   (undone)" } else { "" };
+                (bare(&l.original).to_owned(), format!("→ {}{suffix}", bare(&l.short)))
             }
+            None => ("Nothing trimmed yet. Copy a link.".to_owned(), String::new()),
         });
+        set_text(h, ID_ORIG, &orig_txt);
+        set_text(h, ID_SHORT, &short_txt);
         EnableWindow(GetDlgItem(h, ID_UNDO), clipboard::can_undo() as i32);
 
-        let list = GetDlgItem(h, ID_LIST);
-        // WM_SETREDRAW off while refilling: one repaint instead of one per row.
-        SendMessageW(list, WM_SETREDRAW, 0, 0);
-        SendMessageW(list, LB_RESETCONTENT, 0, 0);
-        let empty = history::with(|items| {
-            // Owner-drawn rows read history at paint time, so the list only needs the row count.
-            for _ in items {
-                SendMessageW(list, LB_ADDSTRING, 0, 0);
+        // Only rebuild ID_LIST when history actually mutated, preserving selection & scroll.
+        let hist_gen = history::generation();
+        if LAST_HIST_GEN.swap(hist_gen, Relaxed) != hist_gen {
+            let rows: Vec<Vec<u16>> = history::with(|items| {
+                items.iter().map(|e| wide(&format!("{} {}", e.when, bare(&e.link)))).collect()
+            });
+            let list = GetDlgItem(h, ID_LIST);
+            // WM_SETREDRAW off while refilling: one repaint instead of one per row.
+            SendMessageW(list, WM_SETREDRAW, 0, 0);
+            SendMessageW(list, LB_RESETCONTENT, 0, 0);
+            for row in &rows {
+                SendMessageW(list, LB_ADDSTRING, 0, row.as_ptr() as LPARAM);
             }
-            items.is_empty()
-        });
-        SendMessageW(list, WM_SETREDRAW, 1, 0);
-        EnableWindow(GetDlgItem(h, ID_CLEAR), (!empty) as i32);
+            SendMessageW(list, WM_SETREDRAW, 1, 0);
+            EnableWindow(GetDlgItem(h, ID_CLEAR), (!rows.is_empty()) as i32);
+        }
 
         let n = settings::TRIMMED.load(Relaxed);
         let stats = match n {
@@ -380,7 +424,7 @@ fn refresh_now(h: HWND) {
         set_text(h, ID_STATS, &stats);
 
         // Owner-drawn controls read their state while painting, so "refresh" = repaint them all.
-        RedrawWindow(h, null(), null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN);
+        RedrawWindow(h, null(), null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
     }
 }
 
@@ -429,74 +473,79 @@ fn draw_item(d: &DRAWITEMSTRUCT) {
     // Focus ring only for keyboard users: ODS_NOFOCUSRECT is set while Windows hides focus cues.
     let focus = d.itemState & ODS_FOCUS != 0 && d.itemState & ODS_NOFOCUSRECT == 0;
 
-    let c = match d.CtlType {
+    match d.CtlType {
         ODT_LISTBOX => {
             // itemID = -1 means "empty list, draw focus only". Nothing to draw then.
             let Some((when, link)) = history::with(|items| items.get(d.itemID as usize).map(|e| (e.when.clone(), e.link.clone()))) else {
                 return;
             };
             let bg = if d.itemState & ODS_SELECTED != 0 { SURFACE_HI } else { SURFACE };
-            let Some(mut c) = Canvas::new(d.hDC, w, h, bg) else { return };
-            let pad = s(10.0) as i32;
-            let t = c.text(&when, RECT { left: pad, ..full }, MUTED, font, ONE_LINE | DT_CALCRECT);
-            c.text(&when, RECT { left: pad, ..full }, MUTED, font, ONE_LINE);
-            c.text(bare(&link), RECT { left: t.right + s(12.0) as i32, right: w - pad, ..full }, TEXT, font, ONE_LINE);
-            c
+            Canvas::with_scratch(d.hDC, w, h, bg, |c| {
+                let pad = s(10.0).round() as i32;
+                let t = c.text(&when, RECT { left: pad, ..full }, MUTED, font, ONE_LINE | DT_CALCRECT);
+                c.text(&when, RECT { left: pad, ..full }, MUTED, font, ONE_LINE);
+                c.text(bare(&link), RECT { left: t.right + s(12.0).round() as i32, right: w - pad, ..full }, TEXT, font, ONE_LINE);
+                c.blit(d.hDC, r.left, r.top);
+            });
         }
         ODT_STATIC => {
             // Status row: a coloured dot that matches the tray badge, plus the state in words.
-            let Some(mut c) = Canvas::new(d.hDC, w, h, BG) else { return };
-            let on = F_ENABLED.get();
-            let dot = s(10.0);
-            if on {
-                c.fill(s(1.0) - s(3.0), (hf - dot) / 2.0 - s(3.0), dot + s(6.0), dot + s(6.0), dot / 2.0 + s(3.0), 0x1A3A2B); // soft glow
-            }
-            c.fill(s(1.0), (hf - dot) / 2.0, dot, dot, dot / 2.0, if on { ACCENT } else { RED });
-            let text = if on { "Trimming links" } else { "Paused" };
-            c.text(text, RECT { left: (s(1.0) + dot + s(10.0)) as i32, ..full }, TEXT, bold, ONE_LINE);
-            c
+            Canvas::with_scratch(d.hDC, w, h, BG, |c| {
+                let on = tray::LISTENER_OK.load(Relaxed) && F_ENABLED.get();
+                let dot = s(10.0);
+                let dx = s(3.0); // leaves 3 DIPs on the left so the glow isn't clipped at x = 0
+                if on {
+                    c.fill(dx - s(3.0), (hf - dot) / 2.0 - s(3.0), dot + s(6.0), dot + s(6.0), dot / 2.0 + s(3.0), 0x1A3A2B); // soft glow
+                }
+                c.fill(dx, (hf - dot) / 2.0, dot, dot, dot / 2.0, if on { ACCENT } else { RED });
+                c.text(status_text(), RECT { left: (dx + dot + s(10.0)).round() as i32, ..full }, TEXT, bold, ONE_LINE);
+                c.blit(d.hDC, r.left, r.top);
+            });
         }
         _ if toggle_flag(id).is_some() || id == ID_AUTOSTART => {
             // Label on the left, pill switch on the right; the whole row is the hit target.
-            let Some(mut c) = Canvas::new(d.hDC, w, h, BG) else { return };
-            let on = is_on(id);
-            let (tw, th) = (s(36.0), s(20.0));
-            let (tx, ty) = (wf - tw - s(1.0), (hf - th) / 2.0);
-            if focus {
-                c.stroke(tx - s(3.0), ty - s(3.0), tw + s(6.0), th + s(6.0), th / 2.0 + s(3.0), s(1.5), MUTED);
-            }
-            c.fill(tx, ty, tw, th, th / 2.0, if on { ACCENT } else { TRACK_OFF });
-            let kd = th - s(6.0);
-            let kx = if on { tx + tw - s(3.0) - kd } else { tx + s(3.0) };
-            c.fill(kx, ty + s(3.0), kd, kd, kd / 2.0, KNOB);
-            c.text(label(id), RECT { right: (tx - s(8.0)) as i32, ..full }, TEXT, font, ONE_LINE);
-            c
+            Canvas::with_scratch(d.hDC, w, h, BG, |c| {
+                let on = is_on(id);
+                let (tw, th) = (s(36.0), s(20.0));
+                // 3.5 DIP right inset keeps the 3-DIP focus ring from clipping on the right edge.
+                let (tx, ty) = (wf - tw - s(3.5), (hf - th) / 2.0);
+                if focus {
+                    c.stroke(tx - s(3.0), ty - s(3.0), tw + s(6.0), th + s(6.0), th / 2.0 + s(3.0), s(1.5), MUTED);
+                }
+                c.fill(tx, ty, tw, th, th / 2.0, if on { ACCENT } else { TRACK_OFF });
+                let kd = th - s(6.0);
+                let kx = if on { tx + tw - s(3.0) - kd } else { tx + s(3.0) };
+                c.fill(kx, ty + s(3.0), kd, kd, kd / 2.0, KNOB);
+                c.text(label(id), RECT { right: (tx - s(8.0)).round() as i32, ..full }, TEXT, font, ONE_LINE);
+                c.blit(d.hDC, r.left, r.top);
+            });
         }
         _ => {
             // Push buttons. "Resume" is the one call to action, so it alone gets the accent fill.
-            let Some(mut c) = Canvas::new(d.hDC, w, h, BG) else { return };
-            let disabled = d.itemState & ODS_DISABLED != 0;
-            let pressed = d.itemState & ODS_SELECTED != 0;
-            let primary = id == ID_PAUSE && !F_ENABLED.get();
-            let rad = s(6.0);
-            let (fill, fg) = match (primary, pressed, disabled) {
-                (true, _, _) => (ACCENT, BG),
-                (_, _, true) => (SURFACE, FAINT),
-                (_, true, _) => (SURFACE_HI, TEXT),
-                _ => (SURFACE, TEXT),
-            };
-            c.fill(0.0, 0.0, wf, hf, rad, fill);
-            if !primary {
-                c.stroke(0.0, 0.0, wf, hf, rad, 1.0, BORDER);
-            }
-            if focus {
-                c.stroke(0.0, 0.0, wf, hf, rad, s(1.5), MUTED);
-            }
-            c.text(label(id), full, fg, font, ONE_LINE | DT_CENTER);
-            c
+            Canvas::with_scratch(d.hDC, w, h, BG, |c| {
+                let disabled = d.itemState & ODS_DISABLED != 0;
+                let pressed = d.itemState & ODS_SELECTED != 0;
+                let primary = id == ID_PAUSE && !F_ENABLED.get();
+                let rad = s(6.0);
+                let (fill, fg) = match (primary, pressed, disabled) {
+                    (true, true, _) => (ACCENT_PRESSED, BG),
+                    (true, false, _) => (ACCENT, BG),
+                    (_, _, true) => (SURFACE, FAINT),
+                    (_, true, _) => (SURFACE_HI, TEXT),
+                    _ => (SURFACE, TEXT),
+                };
+                c.fill(0.0, 0.0, wf, hf, rad, fill);
+                if !primary {
+                    c.stroke(0.0, 0.0, wf, hf, rad, 1.0, BORDER);
+                }
+                if focus {
+                    c.stroke(0.0, 0.0, wf, hf, rad, s(1.5), MUTED);
+                }
+                c.text(label(id), full, fg, font, ONE_LINE | DT_CENTER);
+                c.blit(d.hDC, r.left, r.top);
+            });
         }
-    };
-    c.blit(d.hDC, r.left, r.top);
+    }
 }
 
 /// Volume slider: thin track, accent fill up to the thumb, round knob. Drawn in
@@ -512,20 +561,23 @@ fn draw_slider(cd: &NMCUSTOMDRAW) {
         let s = |v: f32| v * k;
         let enabled = IsWindowEnabled(hw) != 0;
         let focus = GetFocus() == hw && SendMessageW(hw, WM_QUERYUISTATE, 0, 0) as usize & UISF_HIDEFOCUS == 0;
-        let Some(mut c) = Canvas::new(cd.hdc, cr.right, cr.bottom, BG) else { return };
-
-        // cd.rc is the channel: it spans thumb-centre-at-0 to thumb-centre-at-100.
-        let (x0, x1) = (cd.rc.left as f32, cd.rc.right as f32);
-        let (cx, cy) = ((th.left + th.right) as f32 / 2.0, (th.top + th.bottom) as f32 / 2.0);
-        let t = s(4.0);
-        c.fill(x0, cy - t / 2.0, x1 - x0, t, t / 2.0, TRACK_OFF);
-        c.fill(x0, cy - t / 2.0, (cx - x0).max(t), t, t / 2.0, if enabled { ACCENT } else { FAINT });
-        let kr = s(8.0);
-        if focus {
-            c.stroke(cx - kr - s(3.0), cy - kr - s(3.0), 2.0 * kr + s(6.0), 2.0 * kr + s(6.0), kr + s(3.0), s(1.5), MUTED);
-        }
-        c.fill(cx - kr, cy - kr, 2.0 * kr, 2.0 * kr, kr, if enabled { KNOB } else { FAINT });
-        c.blit(cd.hdc, 0, 0);
+        Canvas::with_scratch(cd.hdc, cr.right, cr.bottom, BG, |c| {
+            let kr = s(8.0);
+            let pad = kr + s(3.5);
+            // cd.rc is the channel: it spans thumb-centre-at-0 to thumb-centre-at-100.
+            let x0 = (cd.rc.left as f32).max(pad);
+            let x1 = (cd.rc.right as f32).min(cr.right as f32 - pad).max(x0);
+            let cx = ((th.left + th.right) as f32 / 2.0).clamp(x0, x1);
+            let cy = (th.top + th.bottom) as f32 / 2.0;
+            let t = s(4.0);
+            c.fill(x0, cy - t / 2.0, x1 - x0, t, t / 2.0, TRACK_OFF);
+            c.fill(x0, cy - t / 2.0, (cx - x0).max(t), t, t / 2.0, if enabled { ACCENT } else { FAINT });
+            if focus {
+                c.stroke(cx - kr - s(3.0), cy - kr - s(3.0), 2.0 * kr + s(6.0), 2.0 * kr + s(6.0), kr + s(3.0), s(1.5), MUTED);
+            }
+            c.fill(cx - kr, cy - kr, 2.0 * kr, 2.0 * kr, kr, if enabled { KNOB } else { FAINT });
+            c.blit(cd.hdc, 0, 0);
+        });
     }
 }
 
@@ -536,15 +588,28 @@ fn paint_bg(h: HWND, hdc: HDC) {
         GetClientRect(h, &mut cr);
         let dpi = GetDpiForWindow(h);
         let sc = |v: i32| scale(v, dpi) as f32;
-        let Some(mut c) = Canvas::new(hdc, cr.right, cr.bottom, BG) else { return };
-        for y in SEPARATORS {
-            c.fill(sc(M), sc(y), sc(W - 2 * M), 1.0, 0.0, BORDER); // exactly 1 px at any scale: a hairline
-        }
-        let (fx, fy, fw, fh) = FRAME;
-        let rad = sc(8);
-        c.fill(sc(fx), sc(fy), sc(fw), sc(fh), rad, SURFACE);
-        c.stroke(sc(fx), sc(fy), sc(fw), sc(fh), rad, 1.0, BORDER);
-        c.blit(hdc, 0, 0);
+        Canvas::with_scratch(hdc, cr.right, cr.bottom, BG, |c| {
+            for y in SEPARATORS {
+                c.fill(sc(M), sc(y), sc(W - 2 * M), 1.0, 0.0, BORDER); // exactly 1 px at any scale: a hairline
+            }
+            let (fx, fy, fw, fh) = FRAME;
+            let rad = sc(8);
+            c.fill(sc(fx), sc(fy), sc(fw), sc(fh), rad, SURFACE);
+            c.stroke(sc(fx), sc(fy), sc(fw), sc(fh), rad, 1.0, BORDER);
+            c.blit(hdc, 0, 0);
+        });
+    }
+}
+
+fn copy_selected_history(h: HWND) {
+    let sel = unsafe { SendDlgItemMessageW(h, ID_LIST, LB_GETCURSEL, 0, 0) };
+    // LB_ERR is -1, so the usize conversion fails and we skip.
+    if let Ok(i) = usize::try_from(sel)
+        && let Some(link) = history::with(|items| items.get(i).map(|e| e.link.clone()))
+    {
+        clipboard::copy(&link);
+        set_text(h, ID_HINT, "copied ✓");
+        unsafe { SetTimer(h, 1, 1500, None) }; // restore the hint shortly
     }
 }
 
@@ -564,6 +629,7 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                             Some(f) => f.set(on),
                             None => settings::set_autostart(on),
                         }
+                        sync_toggle_text(h, id);
                         InvalidateRect(GetDlgItem(h, id), null(), 0);
                         if id == ID_SOUND {
                             let vol = GetDlgItem(h, ID_VOLUME);
@@ -579,15 +645,10 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                         history::clear();
                         refresh_now(h);
                     }
-                    ID_LIST if code == LBN_DBLCLK => {
-                        let sel = SendDlgItemMessageW(h, ID_LIST, LB_GETCURSEL, 0, 0);
-                        // LB_ERR is -1, so the usize conversion fails and we skip.
-                        if let Ok(i) = usize::try_from(sel)
-                            && let Some(link) = history::with(|items| items.get(i).map(|e| e.link.clone()))
-                        {
-                            clipboard::copy(&link);
-                            set_text(h, ID_HINT, "copied ✓");
-                            SetTimer(h, 1, 1500, None); // restore the hint shortly
+                    ID_LIST if code == LBN_DBLCLK => copy_selected_history(h),
+                    IDOK_ => {
+                        if GetFocus() == GetDlgItem(h, ID_LIST) {
+                            copy_selected_history(h);
                         }
                     }
                     IDCANCEL_ => {
@@ -596,6 +657,14 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                     _ => {}
                 }
                 0
+            }
+            WM_VKEYTOITEM => {
+                let vk = (wp & 0xFFFF) as u16;
+                if vk == VK_C && (GetKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0 {
+                    copy_selected_history(h);
+                    return -2; // handled; suppress listbox default character navigation
+                }
+                -1 // default listbox keyboard handling
             }
             WM_HSCROLL => {
                 let ctl = lp as HWND;
@@ -612,9 +681,9 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                 0
             }
             WM_NOTIFY => {
-                let hdr = &*(lp as *const NMHDR);
+                let Some(hdr) = (lp as *const NMHDR).as_ref() else { return 0 };
                 if hdr.code == NM_CUSTOMDRAW && hdr.idFrom == ID_VOLUME as usize {
-                    let cd = &*(lp as *const NMCUSTOMDRAW);
+                    let Some(cd) = (lp as *const NMCUSTOMDRAW).as_ref() else { return 0 };
                     return match cd.dwDrawStage {
                         CDDS_PREPAINT => CDRF_NOTIFYITEMDRAW as LRESULT,
                         CDDS_ITEMPREPAINT => {
@@ -629,12 +698,20 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                 0
             }
             WM_DRAWITEM => {
-                draw_item(&*(lp as *const DRAWITEMSTRUCT));
-                1
+                if let Some(d) = (lp as *const DRAWITEMSTRUCT).as_ref() {
+                    draw_item(d);
+                    1
+                } else {
+                    0
+                }
             }
             WM_MEASUREITEM => {
-                (*(lp as *mut MEASUREITEMSTRUCT)).itemHeight = scale(ROW_H, GetDpiForWindow(h)) as u32;
-                1
+                if let Some(m) = (lp as *mut MEASUREITEMSTRUCT).as_mut() {
+                    m.itemHeight = scale(ROW_H, GetDpiForWindow(h)) as u32;
+                    1
+                } else {
+                    0
+                }
             }
             WM_TIMER => {
                 KillTimer(h, 1);
@@ -665,10 +742,11 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             }
             WM_DPICHANGED => {
                 // Moved to a monitor with different scaling: rebuild fonts and
-                // layout, then take the rect Windows suggests (keeps the window under the cursor).
-                apply_dpi(h, (wp & 0xFFFF) as u32);
-                let r = &*(lp as *const RECT);
-                SetWindowPos(h, null_mut(), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+                // layout, and size to the exact outer rect computed for the new DPI.
+                let (ww, wh) = apply_dpi(h, (wp & 0xFFFF) as u32);
+                if let Some(r) = (lp as *const RECT).as_ref() {
+                    SetWindowPos(h, null_mut(), r.left, r.top, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
+                }
                 0
             }
             WM_CLOSE => {
@@ -678,6 +756,8 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             WM_DESTROY => {
                 // Only this window goes away. No PostQuitMessage: the app keeps running in the tray.
                 WND.store(null_mut(), Relaxed);
+                LAST_HIST_GEN.store(0, Relaxed);
+                paint::release_scratch();
                 for slot in [&FONT, &FONT_BOLD] {
                     let f = slot.swap(null_mut(), Relaxed);
                     if !f.is_null() {

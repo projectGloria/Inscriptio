@@ -22,11 +22,11 @@ use windows_sys::core::w;
 
 use clipboard::trace;
 
-/// Explorer broadcasts this after it restarts. Re-adding the icon on it keeps
-/// the tray entry from silently vanishing after an explorer.exe crash.
 /// Posted by a second `--settings` launch (see main) to the running instance.
 const WM_SHOW_SETTINGS: u32 = WM_APP + 3;
 
+/// Explorer broadcasts this after it restarts. Re-adding the icon on it keeps
+/// the tray entry from silently vanishing after an explorer.exe crash.
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 fn main() {
@@ -81,8 +81,23 @@ fn main() {
 
         // Event-driven: the thread sleeps in GetMessageW (0% CPU) until the
         // clipboard actually changes. No polling, no timers.
-        if AddClipboardFormatListener(hwnd) == 0 {
+        let mut listening = false;
+        for _ in 0..3 {
+            if AddClipboardFormatListener(hwnd) != 0 {
+                listening = true;
+                break;
+            }
+            windows_sys::Win32::System::Threading::Sleep(50);
+        }
+        tray::LISTENER_OK.store(listening, Relaxed);
+        if !listening {
             trace!("AddClipboardFormatListener FAILED, error {}", GetLastError());
+            MessageBoxW(
+                null_mut(),
+                w!("Inscriptio could not register its clipboard listener and will not trim links."),
+                w!("Inscriptio"),
+                MB_OK | MB_ICONWARNING,
+            );
         } else {
             trace!("listening for clipboard changes");
         }
@@ -137,6 +152,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             // Registered messages are runtime values, so they can't be match patterns.
             m if m != 0 && m == TASKBAR_CREATED.load(Relaxed) => {
+                tray::reload_icons();
                 tray::add(hwnd);
                 0
             }

@@ -2,12 +2,13 @@
 
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicPtr, Ordering::Relaxed};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering::Relaxed};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+    NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::core::w;
@@ -23,6 +24,9 @@ pub static MAIN: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 pub fn main_hwnd() -> HWND {
     MAIN.load(Relaxed)
 }
+
+/// Set to false if AddClipboardFormatListener fails at startup.
+pub static LISTENER_OK: AtomicBool = AtomicBool::new(true);
 
 const ID_TOGGLE: usize = 1;
 const ID_UNDO: usize = 2;
@@ -53,13 +57,23 @@ fn notify(hwnd: HWND, op: u32) {
         nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
         nid.hWnd = hwnd;
         nid.uID = 1;
-        nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-        nid.uCallbackMessage = WM_TRAY;
-        let on = F_ENABLED.get();
-        nid.hIcon = icon(!on);
-        let tip = if on { "Inscriptio: trimming links" } else { "Inscriptio (paused)" };
-        for (dst, src) in nid.szTip.iter_mut().zip(tip.encode_utf16()) {
-            *dst = src; // zeroed() already provides the NUL terminator
+        if op != NIM_DELETE {
+            nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+            nid.uCallbackMessage = WM_TRAY;
+            let ok = LISTENER_OK.load(Relaxed);
+            let on = ok && F_ENABLED.get();
+            nid.hIcon = icon(!on);
+            let tip = if !ok {
+                "Inscriptio (clipboard listener failed)"
+            } else if on {
+                "Inscriptio: trimming links"
+            } else {
+                "Inscriptio (paused)"
+            };
+            let max = nid.szTip.len() - 1;
+            for (dst, src) in nid.szTip[..max].iter_mut().zip(tip.encode_utf16()) {
+                *dst = src; // zeroed() already provides the NUL terminator
+            }
         }
         Shell_NotifyIconW(op, &nid);
     }
@@ -69,15 +83,39 @@ pub fn on_tray(hwnd: HWND, lp: LPARAM) {
     // Legacy (pre-NOTIFYICON_VERSION_4) callback: LOWORD(lParam) is the mouse message.
     match (lp as u32) & 0xFFFF {
         WM_LBUTTONUP => ui::show(),
-        WM_RBUTTONUP | WM_CONTEXTMENU => menu(hwnd),
+        WM_RBUTTONUP => menu(hwnd, false),
+        WM_CONTEXTMENU => menu(hwnd, true),
         _ => {}
     }
 }
 
-fn menu(hwnd: HWND) {
+fn menu_pos(hwnd: HWND, keyboard: bool) -> POINT {
+    unsafe {
+        if keyboard {
+            let ident = NOTIFYICONIDENTIFIER {
+                cbSize: size_of::<NOTIFYICONIDENTIFIER>() as u32,
+                hWnd: hwnd,
+                uID: 1,
+                guidItem: std::mem::zeroed(),
+            };
+            let mut rc: RECT = std::mem::zeroed();
+            if Shell_NotifyIconGetRect(&ident, &mut rc) == 0 {
+                return POINT { x: (rc.left + rc.right) / 2, y: (rc.top + rc.bottom) / 2 };
+            }
+        }
+        let mut pt = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut pt);
+        pt
+    }
+}
+
+fn menu(hwnd: HWND, keyboard: bool) {
     let on = F_ENABLED.get();
     unsafe {
         let m = CreatePopupMenu();
+        if m.is_null() {
+            return;
+        }
         // A verb, not a checkmark: "Trim links ✓" didn't read as the pause switch.
         AppendMenuW(m, MF_STRING, ID_TOGGLE, if on { w!("Pause") } else { w!("Resume") });
         AppendMenuW(m, MF_STRING | if clipboard::can_undo() { 0 } else { MF_GRAYED }, ID_UNDO, w!("Undo last trim"));
@@ -87,8 +125,7 @@ fn menu(hwnd: HWND) {
         // Bold = what a left-click does, the standard shell hint.
         SetMenuDefaultItem(m, ID_SETTINGS as u32, 0);
 
-        let mut pt = POINT { x: 0, y: 0 };
-        GetCursorPos(&mut pt);
+        let pt = menu_pos(hwnd, keyboard);
         // Without the foreground dance, the menu won't close when you click
         // elsewhere. Classic shell quirk (KB135788).
         SetForegroundWindow(hwnd);
@@ -110,8 +147,9 @@ fn menu(hwnd: HWND) {
 
 // ---------------------------------------------------------------- icons
 
-/// [normal, paused], built once. Icons live for the whole process, so they are never destroyed.
+/// [normal, paused] small tray icons, plus the large window icon.
 static ICONS: [AtomicPtr<c_void>; 2] = [AtomicPtr::new(null_mut()), AtomicPtr::new(null_mut())];
+static LARGE_ICON: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 
 pub fn icon(paused: bool) -> HICON {
     let slot = &ICONS[paused as usize];
@@ -119,17 +157,50 @@ pub fn icon(paused: bool) -> HICON {
     if !cached.is_null() {
         return cached;
     }
-    let base = base_icon();
-    let h = if paused { badge(base).unwrap_or(base) } else { base };
+    // Reuse the cached normal icon as the base for the badged variant so we
+    // never load (and leak) a second copy of the base icon.
+    let h = if paused {
+        let base = icon(false);
+        badge(base).unwrap_or(base)
+    } else {
+        load_icon(SM_CXSMICON, SM_CYSMICON)
+    };
     slot.store(h, Relaxed);
     h
 }
 
-/// Embedded icon (resource ID 1, from app.rc) at the tray's small-icon size.
-/// LoadImageW with SM_CXSMICON makes Windows pick the frame for the current
-/// DPI (16 px at 100%, 24 at 150%, 32 at 200%) instead of downscaling
-/// LoadIconW's 32 px default. That's what keeps the tray icon crisp.
-fn base_icon() -> HICON {
+/// Large icon (32/48 px) for Alt+Tab and the taskbar button of the settings window.
+pub fn large_icon() -> HICON {
+    let cached = LARGE_ICON.load(Relaxed);
+    if !cached.is_null() {
+        return cached;
+    }
+    let h = load_icon(SM_CXICON, SM_CYICON);
+    LARGE_ICON.store(h, Relaxed);
+    h
+}
+
+/// Rebuild cached tray icons at the current system DPI (e.g. after Explorer restarts).
+pub fn reload_icons() {
+    let old_normal = ICONS[0].swap(null_mut(), Relaxed);
+    let old_paused = ICONS[1].swap(null_mut(), Relaxed);
+    // Refresh the tray icon first so the shell stops referencing the old handles.
+    let hwnd = main_hwnd();
+    if !hwnd.is_null() {
+        notify(hwnd, NIM_MODIFY);
+    }
+    unsafe {
+        if !old_paused.is_null() && old_paused != old_normal {
+            DestroyIcon(old_paused);
+        }
+        if !old_normal.is_null() {
+            DestroyIcon(old_normal);
+        }
+    }
+}
+
+/// Embedded icon (resource ID 1, from app.rc) at the requested system metric size.
+fn load_icon(cx_metric: SYSTEM_METRICS_INDEX, cy_metric: SYSTEM_METRICS_INDEX) -> HICON {
     unsafe {
         // MAKEINTRESOURCE(1): an integer ID smuggled through a PCWSTR.
         // `without_provenance` says "this is a number, never dereferenced".
@@ -138,12 +209,31 @@ fn base_icon() -> HICON {
             GetModuleHandleW(null()),
             std::ptr::without_provenance::<u16>(1),
             IMAGE_ICON,
-            GetSystemMetrics(SM_CXSMICON),
-            GetSystemMetrics(SM_CYSMICON),
+            GetSystemMetrics(cx_metric),
+            GetSystemMetrics(cy_metric),
             LR_DEFAULTCOLOR,
         );
         // Fallback keeps the app usable if the resource is somehow missing.
         if h.is_null() { LoadIconW(null_mut(), IDI_APPLICATION) } else { h }
+    }
+}
+
+/// RAII wrapper for GDI objects created inside `badge()`.
+struct GdiObj(HGDIOBJ);
+impl Drop for GdiObj {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { DeleteObject(self.0) };
+        }
+    }
+}
+
+struct ScreenDc(HDC);
+impl Drop for ScreenDc {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { ReleaseDC(null_mut(), self.0) };
+        }
     }
 }
 
@@ -157,18 +247,21 @@ fn badge(base: HICON) -> Option<HICON> {
             return None;
         }
         // GetIconInfo hands us *copies* of the bitmaps. We own them, so we must delete them.
-        let cleanup = |ii: &ICONINFO| {
-            DeleteObject(ii.hbmColor);
-            DeleteObject(ii.hbmMask);
-        };
+        let _ii_color = GdiObj(ii.hbmColor);
+        let _ii_mask = GdiObj(ii.hbmMask);
         if ii.hbmColor.is_null() {
-            cleanup(&ii);
             return None; // monochrome icon: no alpha channel to work with
         }
 
         let mut bm: BITMAP = std::mem::zeroed();
-        GetObjectW(ii.hbmColor, size_of::<BITMAP>() as i32, (&mut bm as *mut BITMAP).cast());
+        if GetObjectW(ii.hbmColor, size_of::<BITMAP>() as i32, (&mut bm as *mut BITMAP).cast()) == 0 {
+            return None;
+        }
         let (w, h) = (bm.bmWidth, bm.bmHeight);
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        let count = (w as usize).checked_mul(h as usize)?;
 
         let mut bmi: BITMAPINFO = std::mem::zeroed();
         bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
@@ -178,22 +271,22 @@ fn badge(base: HICON) -> Option<HICON> {
         bmi.bmiHeader.biBitCount = 32;
         bmi.bmiHeader.biCompression = BI_RGB;
 
-        let mut px = vec![0u32; (w * h) as usize];
-        let dc = GetDC(null_mut());
-        let got = GetDIBits(dc, ii.hbmColor, 0, h as u32, px.as_mut_ptr().cast(), &mut bmi, DIB_RGB_COLORS);
+        let mut px = vec![0u32; count];
+        let dc = ScreenDc(GetDC(null_mut()));
+        if dc.0.is_null() {
+            return None;
+        }
+        let got = GetDIBits(dc.0, ii.hbmColor, 0, h as u32, px.as_mut_ptr().cast(), &mut bmi, DIB_RGB_COLORS);
         if got == 0 {
-            ReleaseDC(null_mut(), dc);
-            cleanup(&ii);
             return None;
         }
 
         paint_dot(&mut px, w as usize, h as usize);
 
         let mut bits: *mut c_void = null_mut();
-        let color = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
-        ReleaseDC(null_mut(), dc);
-        if color.is_null() || bits.is_null() {
-            cleanup(&ii);
+        let color = GdiObj(CreateDIBSection(dc.0, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0));
+        drop(dc);
+        if color.0.is_null() || bits.is_null() {
             return None;
         }
         std::ptr::copy_nonoverlapping(px.as_ptr(), bits.cast::<u32>(), px.len());
@@ -201,13 +294,13 @@ fn badge(base: HICON) -> Option<HICON> {
         // With a 32-bpp color bitmap Windows uses its alpha channel, and an
         // all-zero AND mask just means "use the alpha". Rows are WORD-aligned.
         let mask_bytes = vec![0u8; (w as usize).div_ceil(16) * 2 * h as usize];
-        let mask = CreateBitmap(w, h, 1, 1, mask_bytes.as_ptr().cast());
+        let mask = GdiObj(CreateBitmap(w, h, 1, 1, mask_bytes.as_ptr().cast()));
+        if mask.0.is_null() {
+            return None;
+        }
 
-        let out = ICONINFO { fIcon: 1, xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color };
+        let out = ICONINFO { fIcon: 1, xHotspot: 0, yHotspot: 0, hbmMask: mask.0, hbmColor: color.0 };
         let icon = CreateIconIndirect(&out); // copies the bitmaps, so ours can go
-        DeleteObject(color);
-        DeleteObject(mask);
-        cleanup(&ii);
         (!icon.is_null()).then_some(icon)
     }
 }

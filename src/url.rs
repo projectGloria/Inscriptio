@@ -52,6 +52,12 @@ impl<'a> Url<'a> {
     pub fn segments(&self) -> impl Iterator<Item = &'a str> + 'a {
         self.path.split('/').filter(|s| !s.is_empty())
     }
+
+    /// Raw path segments preserving empty interior segments: "/a//b/" → ["a", "", "b"].
+    pub fn raw_segments(&self) -> impl Iterator<Item = &'a str> + 'a {
+        let trimmed = self.path.trim_matches('/');
+        trimmed.split('/').filter(move |_| !trimmed.is_empty())
+    }
 }
 
 /// Key part of a `key=value` pair.

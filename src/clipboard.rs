@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
-use windows_sys::Win32::Foundation::{GlobalFree, HWND};
+use windows_sys::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData, GetClipboardFormatNameW,
     GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
@@ -75,6 +75,8 @@ pub struct Last {
     pub original: String,
     pub short: String,
     pub undone: bool,
+    /// True for incognito copies or credential-bearing links: hidden in the UI preview.
+    pub private: bool,
     markers: Markers,
 }
 
@@ -131,7 +133,8 @@ fn has(fmt: u32) -> bool {
 
 pub fn on_update(hwnd: HWND) {
     let seq = unsafe { GetClipboardSequenceNumber() };
-    if seq == OWN_SEQ.load(Relaxed) {
+    // 0 is GetClipboardSequenceNumber's error return; only skip on a real match.
+    if seq != 0 && seq == OWN_SEQ.load(Relaxed) {
         trace!("#{seq} own write, ignored");
         return;
     }
@@ -142,26 +145,26 @@ pub fn on_update(hwnd: HWND) {
             return;
         }
     };
-    // process() has returned, so the clipboard is closed and the sequence
-    // number reflects our write. Everything below happens *after* we released
-    // the clipboard: other apps are never blocked by our bookkeeping.
-    OWN_SEQ.store(unsafe { GetClipboardSequenceNumber() }, Relaxed);
+    // process() has already recorded OWN_SEQ while holding the clipboard lock
+    // and closed the clipboard: other apps are never blocked by our bookkeeping.
     trace!("#{seq} REWROTE -> {short}");
 
     settings::record_trim(original.len().saturating_sub(short.len()));
     if F_SOUND.get() {
         sound::play();
     }
+    let is_private = markers.private();
+    let is_sensitive = rules::is_sensitive(&short);
     if F_HISTORY.get() {
-        if markers.private() {
+        if is_private {
             trace!("   not recorded: private/incognito copy");
-        } else if rules::is_sensitive(&short) {
+        } else if is_sensitive {
             trace!("   not recorded: looks like it carries a credential");
         } else {
             history::add(&short);
         }
     }
-    LAST.set(Some(Last { original, short, undone: false, markers }));
+    LAST.set(Some(Last { original, short, undone: false, private: is_private || is_sensitive, markers }));
     ui::refresh();
 }
 
@@ -175,6 +178,11 @@ fn process(hwnd: HWND) -> Result<(String, String, Markers), &'static str> {
     }
 
     let _guard = open(hwnd).ok_or("OpenClipboard kept failing (another app holds it)")?;
+    // Re-check after acquiring the clipboard lock to close the TOCTOU window
+    // with password managers that update the clipboard while we retry open().
+    if has(FMT_EXCLUDE.load(Relaxed)) || has(FMT_IGNORE.load(Relaxed)) {
+        return Err("source marked it monitor-excluded (password manager?)");
+    }
     trace!("   formats: {}", FormatList);
 
     // Snapshot the soft markers *before* EmptyClipboard wipes them.
@@ -186,6 +194,9 @@ fn process(hwnd: HWND) -> Result<(String, String, Markers), &'static str> {
     if !replace(&short, markers) {
         return Err("SetClipboardData failed");
     }
+    // Capture the sequence number *before* CloseClipboard so no other process
+    // can interleave and have its write mistaken for ours.
+    OWN_SEQ.store(unsafe { GetClipboardSequenceNumber() }, Relaxed);
     Ok((text.trim().to_owned(), short, markers))
 }
 
@@ -213,33 +224,99 @@ pub fn copy(text: &str) {
 /// Replace the clipboard from our side, flagged as our own write so the
 /// listener doesn't immediately re-trim it (an undo would be pointless otherwise).
 fn write_own(text: &str, markers: Markers) -> bool {
-    let ok = {
-        let Some(_g) = open(tray::main_hwnd()) else { return false };
-        replace(text, markers)
-    }; // closed here, before we read the final sequence number
+    let hwnd = tray::main_hwnd();
+    if hwnd.is_null() {
+        return false;
+    }
+    let Some(_g) = open(hwnd) else { return false };
+    let ok = replace(text, markers);
     if ok {
+        // Record sequence number while still holding the clipboard lock.
         OWN_SEQ.store(unsafe { GetClipboardSequenceNumber() }, Relaxed);
     }
     ok
 }
 
+/// Owned HGLOBAL that frees itself unless handed to the OS via SetClipboardData.
+struct GlobalBuf(HGLOBAL);
+impl GlobalBuf {
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        unsafe {
+            let h = GlobalAlloc(GMEM_MOVEABLE, bytes.len());
+            if h.is_null() {
+                return None;
+            }
+            let p = GlobalLock(h) as *mut u8;
+            if p.is_null() {
+                GlobalFree(h);
+                return None;
+            }
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+            GlobalUnlock(h);
+            Some(Self(h))
+        }
+    }
+
+    fn set_clipboard(self, fmt: u32) -> bool {
+        let h = self.0;
+        if unsafe { SetClipboardData(fmt, h as HANDLE) }.is_null() {
+            // `self` drops and frees `h`.
+            false
+        } else {
+            // On success the OS owns `h`.
+            std::mem::forget(self);
+            true
+        }
+    }
+}
+impl Drop for GlobalBuf {
+    fn drop(&mut self) {
+        unsafe { GlobalFree(self.0) };
+    }
+}
+
 /// Inside an open clipboard session: wipe it and write text plus markers.
 fn replace(text: &str, m: Markers) -> bool {
-    // UTF-16LE bytes plus a NUL terminator. x86/ARM Windows is always little-endian.
+    // Pre-allocate all buffers *before* EmptyClipboard so an allocation failure
+    // never wipes the user's existing clipboard content.
     let bytes: Vec<u8> = text.encode_utf16().chain(std::iter::once(0)).flat_map(u16::to_le_bytes).collect();
+    let Some(text_buf) = GlobalBuf::from_bytes(&bytes) else { return false };
+
+    let hist_fmt = FMT_HISTORY.load(Relaxed);
+    let hist_buf = match m.history {
+        Some(v) if hist_fmt != 0 => match GlobalBuf::from_bytes(&v.to_le_bytes()) {
+            Some(b) => Some((hist_fmt, v, b)),
+            None => return false,
+        },
+        _ => None,
+    };
+    let cloud_fmt = FMT_CLOUD.load(Relaxed);
+    let cloud_buf = match m.cloud {
+        Some(v) if cloud_fmt != 0 => match GlobalBuf::from_bytes(&v.to_le_bytes()) {
+            Some(b) => Some((cloud_fmt, v, b)),
+            None => return false,
+        },
+        _ => None,
+    };
+
     // EmptyClipboard makes the window passed to OpenClipboard the owner. It
     // also drops the source's HTML/RTF formats, so rich pastes become plain links.
-    unsafe { EmptyClipboard() };
-    if !put(CF_TEXT_W, &bytes) {
+    if unsafe { EmptyClipboard() } == 0 {
         return false;
     }
-    // Re-assert the source's privacy intent. Otherwise a link copied in
-    // incognito would slip into Win+V history the moment we rewrote it.
-    if let Some(v) = m.history {
-        put(FMT_HISTORY.load(Relaxed), &v.to_le_bytes());
+    if !text_buf.set_clipboard(CF_TEXT_W) {
+        return false;
     }
-    if let Some(v) = m.cloud {
-        put(FMT_CLOUD.load(Relaxed), &v.to_le_bytes());
+    // Re-assert the source's privacy intent. If a restrictive (0) marker fails
+    // to attach, wipe the clipboard rather than leaking an incognito link to Win+V.
+    for opt in [hist_buf, cloud_buf] {
+        if let Some((fmt, v, buf)) = opt
+            && !buf.set_clipboard(fmt)
+            && v == 0
+        {
+            unsafe { EmptyClipboard() };
+            return false;
+        }
     }
     true
 }
@@ -282,29 +359,6 @@ fn read_text() -> Option<String> {
         let out = (len <= MAX_UNITS).then(|| String::from_utf16(&buf[..len]).ok()).flatten();
         GlobalUnlock(h);
         out
-    }
-}
-
-/// Copies `bytes` into a fresh HGLOBAL and hands it to the clipboard.
-/// The caller must already have called EmptyClipboard in this open session.
-fn put(fmt: u32, bytes: &[u8]) -> bool {
-    unsafe {
-        let h = GlobalAlloc(GMEM_MOVEABLE, bytes.len());
-        if h.is_null() {
-            return false;
-        }
-        let p = GlobalLock(h) as *mut u8;
-        if p.is_null() {
-            GlobalFree(h);
-            return false;
-        }
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
-        GlobalUnlock(h);
-        if SetClipboardData(fmt, h).is_null() {
-            GlobalFree(h); // only free on failure. On success the OS owns it.
-            return false;
-        }
-        true
     }
 }
 

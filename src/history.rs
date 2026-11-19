@@ -7,9 +7,17 @@
 
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 
 const CAP: usize = 50;
+
+/// Monotonic counter bumped on every mutation so the UI can skip redundant listbox rebuilds.
+static GEN: AtomicU32 = AtomicU32::new(1);
+
+pub fn generation() -> u32 {
+    GEN.load(Relaxed)
+}
 
 pub struct Entry {
     pub when: String,
@@ -42,13 +50,25 @@ fn save(items: &[Entry]) {
         let _ = std::fs::create_dir_all(dir);
     }
     let body: String = items.iter().map(|e| format!("{}\t{}\n", e.when, e.link)).collect();
+    // Atomic write: write to a sibling temp file, then replace `history.tsv`.
     // Best-effort: a failed write must never break trimming.
-    let _ = std::fs::write(p, body);
+    let tmp = p.with_extension("tsv.tmp");
+    if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, &p).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
-/// Borrow the list (loading it on first use).
+fn ensure_loaded() {
+    ITEMS.with_borrow_mut(|slot| {
+        slot.get_or_insert_with(load);
+    });
+}
+
+/// Borrow the list (loading it on first use). Uses a shared borrow so re-entrant
+/// reads (e.g. from synchronous Win32 messages) cannot panic.
 pub fn with<R>(f: impl FnOnce(&[Entry]) -> R) -> R {
-    ITEMS.with_borrow_mut(|slot| f(slot.get_or_insert_with(load)))
+    ensure_loaded();
+    ITEMS.with_borrow(|slot| f(slot.as_deref().unwrap_or(&[])))
 }
 
 pub fn add(link: &str) {
@@ -60,6 +80,7 @@ pub fn add(link: &str) {
         items.truncate(CAP);
         save(items);
     });
+    GEN.fetch_add(1, Relaxed);
 }
 
 pub fn clear() {
@@ -67,6 +88,7 @@ pub fn clear() {
     if let Some(p) = path() {
         let _ = std::fs::remove_file(p);
     }
+    GEN.fetch_add(1, Relaxed);
 }
 
 fn now() -> String {

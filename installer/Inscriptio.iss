@@ -102,6 +102,23 @@ begin
   Result := '';
 end;
 
+procedure InitializeWizard;
+begin
+  { On upgrades, default the autostart checkbox to the user's current in-app
+    setting so upgrading never silently re-enables autostart. }
+  if RegKeyExists(HKCU, 'Software\{#AppName}') then
+    WizardForm.TasksList.Checked[0] :=
+      RegValueExists(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#AppName}');
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  { If the user explicitly unchecked autostart during an upgrade, remove any
+    previously registered Run entry. }
+  if (CurStep = ssPostInstall) and (not WizardIsTaskSelected('autostart')) then
+    RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#AppName}');
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usUninstall then

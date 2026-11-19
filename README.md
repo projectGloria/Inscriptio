@@ -159,8 +159,3 @@ Uninstalling removes the program, its settings, its history and the autostart en
 ## Contributing
 
 Issues and pull requests are welcome. New site rules belong in [`src/rules.rs`](src/rules.rs) together with a test case showing the input and the expected output. Please run `cargo test` before opening a pull request.
-
-## License
-
-<!-- TODO: add a LICENSE file and name the license here. -->
-No license file has been added yet.
