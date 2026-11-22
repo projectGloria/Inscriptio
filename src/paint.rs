@@ -14,14 +14,14 @@ use windows_sys::Win32::Foundation::{COLORREF, RECT};
 use windows_sys::Win32::Graphics::Gdi::*;
 
 // Palette, as 0xRRGGBB (the DIB's native pixel layout).
-pub const BG: u32 = 0x111111;
-pub const SURFACE: u32 = 0x1C1C1C;
-pub const SURFACE_HI: u32 = 0x2A2A2A;
-pub const BORDER: u32 = 0x2C2C2C;
-pub const TEXT: u32 = 0xEDEDED;
-pub const MUTED: u32 = 0x8B8B8B;
+pub const BG: u32 = 0x10141A;
+pub const SURFACE: u32 = 0x1A2029;
+pub const SURFACE_HI: u32 = 0x2B3B44;
+pub const BORDER: u32 = 0x333F4C;
+pub const TEXT: u32 = 0xEEF2F6;
+pub const MUTED: u32 = 0xA9B5C3;
 pub const FAINT: u32 = 0x555555;
-pub const TRACK_OFF: u32 = 0x3A3A3A;
+pub const TRACK_OFF: u32 = 0x465467;
 pub const KNOB: u32 = 0xF5F5F5;
 pub const ACCENT: u32 = 0x3ECF8E;
 pub const RED: u32 = 0xE5484D; // same red as the tray's paused badge
@@ -150,6 +150,9 @@ impl Canvas {
         let r = r.clamp(0.0, (w.min(h)) / 2.0);
         let (x0, y0) = ((x.floor() as i32).max(0), (y.floor() as i32).max(0));
         let (x1, y1) = (((x + w).ceil() as i32).min(cw), ((y + h).ceil() as i32).min(ch));
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
         let (cx, cy) = (x + w / 2.0, y + h / 2.0);
         let (hx, hy) = (w / 2.0 - r, h / 2.0 - r);
 
@@ -226,7 +229,7 @@ impl Drop for Canvas {
 }
 
 /// Linear blend of two 0xRRGGBB colours, a = 0 → `d`, a = 1 → `s`.
-fn mix(d: u32, s: u32, a: f32) -> u32 {
+pub fn mix(d: u32, s: u32, a: f32) -> u32 {
     let ch = |sh: u32| {
         let (dc, sc) = (((d >> sh) & 0xFF) as f32, ((s >> sh) & 0xFF) as f32);
         ((dc + (sc - dc) * a + 0.5) as u32) << sh

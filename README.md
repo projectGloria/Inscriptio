@@ -4,7 +4,7 @@
   <p>A tiny Windows tray app that strips tracking junk from links the moment you copy them.</p>
 
   <!-- TODO: once a GitHub release exists, add: <a href="https://github.com/projectGloria/Inscriptio/releases"><img alt="Release" src="https://img.shields.io/github/v/release/projectGloria/Inscriptio" /></a> -->
-  <img alt="Version 0.3.0" src="https://img.shields.io/badge/version-0.3.0-3ECF8E" />
+  <img alt="Version 0.4.0" src="https://img.shields.io/badge/version-0.4.0-3ECF8E" />
   <img alt="Platform: Windows 10 1703+" src="https://img.shields.io/badge/platform-Windows%2010%2B%20x64-0078D4" />
   <img alt="Rust 2024 edition" src="https://img.shields.io/badge/rust-2024%20edition-CE422B?logo=rust" />
 </div>
@@ -42,11 +42,11 @@ It is a single native Rust executable using the Win32 API directly. No runtime, 
 
 <table>
   <tr>
-    <td align="center"><img src="docs/assets/settings.png" alt="Settings window: trimming active, toggles for timestamps, sound, history and autostart, last trim, history list" width="342" /></td>
-    <td align="center"><img src="docs/assets/settings-paused.png" alt="Settings window in the paused state with a red status dot and a green Resume button" width="342" /></td>
+    <td align="center"><img src="docs/assets/settings.png" alt="Settings with trimming active, Preferences, Last trim, link statistics, and History" width="416" /></td>
+    <td align="center"><img src="docs/assets/settings-paused.png" alt="Settings window in the paused state with a red status dot and a green Resume button" width="416" /></td>
   </tr>
   <tr>
-    <td align="center"><em>Settings: switches, the last trim with Undo, and history.</em></td>
+    <td align="center"><em>Active trimming, preferences, and recent activity.</em></td>
     <td align="center"><em>Paused: one click on Resume turns trimming back on.</em></td>
   </tr>
 </table>
@@ -92,7 +92,7 @@ The rewrite rules in [`src/rules.rs`](src/rules.rs) are pure functions with no W
 
 **Requirements:** Windows 10 version 1703 or later, x64.
 
-<!-- TODO: publish dist\Inscriptio-0.3.0-setup.exe as a GitHub release so this link has something to download. -->
+<!-- TODO: publish dist\Inscriptio-0.4.0-setup.exe as a GitHub release so this link has something to download. -->
 1. Download `Inscriptio-<version>-setup.exe` from the [Releases](https://github.com/projectGloria/Inscriptio/releases) page, or [build it yourself](#building-from-source).
 2. Run it. It installs per user to `%LOCALAPPDATA%\Programs\Inscriptio`, so no administrator prompt.
 3. Choose whether to start Inscriptio with Windows and whether to add a desktop shortcut.
