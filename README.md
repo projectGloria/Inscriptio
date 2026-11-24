@@ -4,7 +4,7 @@
   <p>A tiny Windows tray app that strips tracking junk from links the moment you copy them.</p>
 
   <!-- TODO: once a GitHub release exists, add: <a href="https://github.com/projectGloria/Inscriptio/releases"><img alt="Release" src="https://img.shields.io/github/v/release/projectGloria/Inscriptio" /></a> -->
-  <img alt="Version 0.4.0" src="https://img.shields.io/badge/version-0.4.0-3ECF8E" />
+  <img alt="Version 0.4.2" src="https://img.shields.io/badge/version-0.4.2-3ECF8E" />
   <img alt="Platform: Windows 10 1703+" src="https://img.shields.io/badge/platform-Windows%2010%2B%20x64-0078D4" />
   <img alt="Rust 2024 edition" src="https://img.shields.io/badge/rust-2024%20edition-CE422B?logo=rust" />
 </div>
@@ -92,12 +92,19 @@ The rewrite rules in [`src/rules.rs`](src/rules.rs) are pure functions with no W
 
 **Requirements:** Windows 10 version 1703 or later, x64.
 
-<!-- TODO: publish dist\Inscriptio-0.4.0-setup.exe as a GitHub release so this link has something to download. -->
-1. Download `Inscriptio-<version>-setup.exe` from the [Releases](https://github.com/projectGloria/Inscriptio/releases) page, or [build it yourself](#building-from-source).
-2. Run it. It installs per user to `%LOCALAPPDATA%\Programs\Inscriptio`, so no administrator prompt.
-3. Choose whether to start Inscriptio with Windows and whether to add a desktop shortcut.
+1. Download the Windows x64 installer from the [Releases](https://github.com/projectGloria/Inscriptio/releases) page.
+2. Run the installer. GloriaSetup installs per user to `%LOCALAPPDATA%\Programs\Inscriptio` by default and offers an optional desktop shortcut.
+3. To start Inscriptio at sign-in, enable **Start with Windows** in the app's settings.
 
-Uninstalling removes the program, its settings, its history and the autostart entry.
+**Upgrading from 0.4.0 or earlier.** GloriaSetup detects the old Inno Setup installation and migrates history if you choose to keep your data. The old uninstaller clears settings, trim statistics, and autostart. To keep your settings and statistics, export them before running the upgrade and import them afterward, before launching Inscriptio.
+
+```powershell
+reg export "HKCU\Software\Inscriptio" "$env:USERPROFILE\Inscriptio-settings.reg"
+# Run the GloriaSetup upgrade, then restore the saved values.
+reg import "$env:USERPROFILE\Inscriptio-settings.reg"
+```
+
+Re-enable **Start with Windows** from the app after migrating if you used it before. Before uninstalling with GloriaSetup, turn it off to remove the Run entry. GloriaSetup can also remove local history during uninstall.
 
 ## Usage
 
@@ -134,7 +141,7 @@ Uninstalling removes the program, its settings, its history and the autostart en
 
 - Rust 1.88 or newer (2024 edition, uses let-chains) with the `x86_64-pc-windows-msvc` toolchain
 - Visual Studio Build Tools with the Windows SDK (`rc.exe` embeds the icon and manifest)
-- For the installer only: [Inno Setup](https://jrsoftware.org/isinfo.php) 6.7 or newer (`winget install JRSoftware.InnoSetup`)
+- For installer builds, use PowerShell and Node.js with npm. The build script runs the latest GloriaSetup package.
 
 **Steps**
 
@@ -145,26 +152,21 @@ Uninstalling removes the program, its settings, its history and the autostart en
    ```
 2. Run the tests:
    ```powershell
-   cargo test
+   cargo test --locked
    ```
 3. Build the executable. Output: `target\release\inscriptio.exe`.
    ```powershell
-   cargo build --release
+   cargo build --release --locked
    ```
-4. Optional, build the installer. Output: `dist\Inscriptio-<version>-setup.exe`. The version comes from `Cargo.toml`.
+4. Optional, build the installer. Output: `dist\Inscriptio_<version>_x64-setup.exe`. The script checks that Cargo and GloriaSetup agree on the version and runs a silent installer dry run.
    ```powershell
    & .\installer\build.ps1
    ```
 
 ## How to release
 
-1. Update the version in `Cargo.toml` (and `app.rc`) and commit the change.
-2. Create and push a version tag:
-   ```bash
-   git tag v1.0.0 && git push --tags
-   ```
-3. GitHub Actions (`.github/workflows/build-installers.yml`) builds the Windows x64 installer (`Inscriptio-<version>-windows-x64.exe`), uploads it as the **`installers`** workflow artifact on the **Actions** tab, and automatically publishes a GitHub Release with the installer attached.
-4. Download published installers from the [Releases](https://github.com/projectGloria/Inscriptio/releases) page (or from the **`installers`** artifact on any manual run triggered via **Actions → Build Installers → Run workflow**).
+1. Sync versions in `Cargo.toml`, `Cargo.lock`, `gloria.toml`, `app.rc`, `app.manifest`, and the README badge. Commit the change.
+2. Push the commit to main and dispatch the [Release workflow](.github/workflows/release.yml). It builds, tests, packages, and verifies the installer before publishing the matching tag and GitHub release with `SHA256SUMS.txt`. To verify the build without publishing, enable the workflow's dry-run option.
 
 ## Contributing
 

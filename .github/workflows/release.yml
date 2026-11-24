@@ -1,0 +1,68 @@
+# projectGloria app release. Copy to .github/workflows/release.yml and edit only the `build` job.
+#
+# Runs only when started on purpose: /monjita-github-release, or `gh workflow run release.yml`.
+# Pushing to main never releases.
+#
+#   check   (shared)  version files agree, version not released yet, gloria.toml valid, picks newest gloria-setup
+#   build   (this repo) builds the app and uploads its files as the artifact `app`
+#   release (shared)  packs with that gloria-setup + dry run (or, without gloria.toml, publishes the files as-is),
+#                     then publishes GitHub Release v<version> with SHA256SUMS.txt
+#
+# The shared jobs live in projectGloria/GloriaSetup and are used from @main, so every release picks up
+# the newest checks and the newest gloria-setup without editing this file.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and verify everything, but do not publish
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    uses: projectGloria/GloriaSetup/.github/workflows/app-check.yml@main
+
+  build:
+    needs: check
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # ---- App-specific: build, test, and copy the files to install into stage/ ----
+      # Installer apps: stage/ is the app folder (it must contain gloria.toml's main_exe).
+      # Extensions / Android: stage/ holds the files to publish (e.g. MyExt-<version>.zip, MyApp-<version>.apk).
+      - name: Build
+        shell: pwsh
+        run: |
+          cargo test --release --locked
+          cargo build --release --locked
+          New-Item -ItemType Directory -Path stage -Force | Out-Null
+          Copy-Item -LiteralPath target/release/inscriptio.exe -Destination stage/
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: app
+          path: stage/
+          if-no-files-found: error
+
+  release:
+    needs: [check, build]
+    uses: projectGloria/GloriaSetup/.github/workflows/app-release.yml@main
+    permissions:
+      contents: write
+    with:
+      version: ${{ needs.check.outputs.version }}
+      installer: ${{ needs.check.outputs.installer == 'true' }}
+      gloria_setup: ${{ needs.check.outputs.gloria_setup }}
+      dry_run: ${{ inputs.dry_run }}

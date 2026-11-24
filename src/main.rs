@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::DataExchange::{AddClipboardFormatListener, RemoveClipboardFormatListener};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::System::Threading::{CreateMutexW, GetStartupInfoW, STARTF_TITLEISLINKNAME, STARTUPINFOW};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::core::w;
 
@@ -38,13 +38,17 @@ fn main() {
         if std::env::args().any(|a| a == "--trace") {
             clipboard::TRACE.store(true, Relaxed);
         }
-        let open_settings = std::env::args().any(|a| a == "--settings");
+        // GloriaSetup shortcuts point directly at the executable. Direct launches
+        // (including the HKCU Run entry) still start silently in the tray.
+        let mut startup = STARTUPINFOW::default();
+        GetStartupInfoW(&mut startup);
+        let open_settings = startup.dwFlags & STARTF_TITLEISLINKNAME != 0 || std::env::args().any(|a| a == "--settings");
         if already_running {
             // Easy to trip over: `--trace` while the tray copy runs does nothing,
             // because the first instance owns the listener.
             trace!("another instance is already running, exiting (quit the tray one first)");
             if open_settings {
-                // The Start-menu shortcut runs `--settings`: hand the request to
+                // A shortcut or an explicit --settings launch hands the request to
                 // the running copy instead of silently exiting.
                 let main = FindWindowW(w!("InscriptioWnd"), null());
                 if !main.is_null() {
